@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { Diagram } from '../types/diagram'
 import { db } from '../utils/db'
+import { saveWithVersion } from '../utils/versions'
 
 interface DiagramState {
   diagrams: Diagram[]
@@ -75,7 +76,10 @@ export const useDiagramStore = create<DiagramState>((set, get) => ({
   },
 
   saveDiagram: async (diagram) => {
-    await db.diagrams.put(diagram)
+    // 示意图（标题、内联 SVG 源、热区关系）随类型整体归档
+    await saveWithVersion(diagram.jointTypeId, async () => {
+      await db.diagrams.put(diagram)
+    }, '保存示意图')
     set((state) => ({
       diagrams: state.diagrams.map((item) => item.id === diagram.id ? diagram : item),
       draftSvgMarkup: state.selectedDiagramId === diagram.id ? diagram.svgMarkup : state.draftSvgMarkup,

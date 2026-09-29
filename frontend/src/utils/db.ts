@@ -4,6 +4,7 @@ import type { Furniture } from '../types/furniture'
 import type { JointType } from '../types/jointType'
 import type { Member } from '../types/member'
 import type { DisassemblyStep } from '../types/step'
+import type { JointVersion } from '../types/version'
 
 export class MortiseDatabase extends Dexie {
   joints!: Table<JointType, string>
@@ -11,6 +12,7 @@ export class MortiseDatabase extends Dexie {
   steps!: Table<DisassemblyStep, string>
   diagrams!: Table<Diagram, string>
   furniture!: Table<Furniture, string>
+  jointVersions!: Table<JointVersion, string>
 
   constructor() {
     super('gbmortise-db')
@@ -39,6 +41,35 @@ export class MortiseDatabase extends Dexie {
       await transaction.table<Furniture, string>('furniture').toCollection().modify((furniture) => {
         furniture.schemaRev = 2
       })
+    })
+    // version(3)：新增只追加的类型版本档案表；旧库升级时为每个已有类型
+    // 自动补上首次版本，旧记录本身不做任何改动。
+    this.version(3).stores({
+      ...schema,
+      jointVersions: 'id, jointTypeId, versionNo, [jointTypeId+versionNo], createdAt',
+    }).upgrade(async (transaction) => {
+      const versionTable = transaction.table<JointVersion, string>('jointVersions')
+      const joints = await transaction.table<JointType, string>('joints').toCollection().sortBy('id')
+      for (const joint of joints) {
+        const [members, steps, diagrams, furniture] = await Promise.all([
+          transaction.table<Member, string>('members').where('jointTypeId').equals(joint.id).toArray(),
+          transaction.table<DisassemblyStep, string>('steps').where('jointTypeId').equals(joint.id).toArray(),
+          transaction.table<Diagram, string>('diagrams').where('jointTypeId').equals(joint.id).toArray(),
+          transaction.table<Furniture, string>('furniture').where('jointTypeId').equals(joint.id).toArray(),
+        ])
+        await versionTable.add({
+          id: `version-${joint.id}-0001`,
+          jointTypeId: joint.id,
+          versionNo: 1,
+          createdAt: new Date().toISOString(),
+          note: '旧库升级，自动补首次版本',
+          joint,
+          members,
+          steps: steps.sort((a, b) => a.seq - b.seq),
+          diagrams,
+          furniture,
+        })
+      }
     })
   }
 }
@@ -174,14 +205,50 @@ const furnitureSeeds: Furniture[] = [
 
 export const db = new MortiseDatabase()
 
+function buildJointVersions(
+  joints: JointType[],
+  members: Member[],
+  steps: DisassemblyStep[],
+  diagrams: Diagram[],
+  furniture: Furniture[],
+  note: string,
+): JointVersion[] {
+  const seededAt = new Date().toISOString()
+  return joints.map((joint) => ({
+    id: `version-${joint.id}-0001`,
+    jointTypeId: joint.id,
+    versionNo: 1,
+    createdAt: seededAt,
+    note,
+    joint,
+    members: members.filter((item) => item.jointTypeId === joint.id),
+    steps: steps
+      .filter((item) => item.jointTypeId === joint.id)
+      .sort((a, b) => a.seq - b.seq),
+    diagrams: diagrams.filter((item) => item.jointTypeId === joint.id),
+    furniture: furniture.filter((item) => item.jointTypeId === joint.id),
+  }))
+}
+
 async function writeSeedData(): Promise<void> {
-  await db.transaction('rw', [db.joints, db.members, db.steps, db.diagrams, db.furniture], async () => {
-    await db.joints.bulkAdd(jointSeeds.map((item) => ({ ...item, schemaRev: 2 })))
-    await db.members.bulkAdd(memberSeeds.map((item) => ({ ...item, schemaRev: 2 })))
-    await db.steps.bulkAdd(stepSeeds.map((item) => ({ ...item, schemaRev: 2 })))
-    await db.diagrams.bulkAdd(diagramSeeds.map((item) => ({ ...item, schemaRev: 2 })))
-    await db.furniture.bulkAdd(furnitureSeeds.map((item) => ({ ...item, schemaRev: 2 })))
-  })
+  const joints = jointSeeds.map((item) => ({ ...item, schemaRev: 2 }))
+  const members = memberSeeds.map((item) => ({ ...item, schemaRev: 2 }))
+  const steps = stepSeeds.map((item) => ({ ...item, schemaRev: 2 }))
+  const diagrams = diagramSeeds.map((item) => ({ ...item, schemaRev: 2 }))
+  const furniture = furnitureSeeds.map((item) => ({ ...item, schemaRev: 2 }))
+  const versions = buildJointVersions(joints, members, steps, diagrams, furniture, '种子数据，首次版本')
+  await db.transaction(
+    'rw',
+    [db.joints, db.members, db.steps, db.diagrams, db.furniture, db.jointVersions],
+    async () => {
+      await db.joints.bulkAdd(joints)
+      await db.members.bulkAdd(members)
+      await db.steps.bulkAdd(steps)
+      await db.diagrams.bulkAdd(diagrams)
+      await db.furniture.bulkAdd(furniture)
+      await db.jointVersions.bulkAdd(versions)
+    },
+  )
 }
 
 export async function ensureSeedData(): Promise<void> {

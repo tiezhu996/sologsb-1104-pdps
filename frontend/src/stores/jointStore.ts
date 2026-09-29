@@ -3,6 +3,7 @@ import type { Furniture, FurnitureName } from '../types/furniture'
 import type { JointType } from '../types/jointType'
 import type { Member } from '../types/member'
 import { db, ensureSeedData } from '../utils/db'
+import { ensureInitialVersions, saveWithVersion, scheduleJointVersion } from '../utils/versions'
 
 export type JointDraft = Omit<JointType, 'id' | 'schemaRev'>
 export type FurnitureDraft = Omit<Furniture, 'id' | 'schemaRev'>
@@ -42,6 +43,7 @@ export const useJointStore = create<JointState>((set, get) => ({
     set({ loading: true })
     try {
       await ensureSeedData()
+      await ensureInitialVersions()
       const [joints, members, furniture, steps] = await Promise.all([
         db.joints.toArray(),
         db.members.toArray(),
@@ -69,7 +71,10 @@ export const useJointStore = create<JointState>((set, get) => ({
 
   addJoint: async (draft) => {
     const joint: JointType = { ...draft, id: createId('joint'), schemaRev: 2 }
-    await db.joints.add(joint)
+    // 新建类型时在同一事务内写入主记录与首次版本档案
+    await saveWithVersion(joint.id, async () => {
+      await db.joints.add(joint)
+    }, '新建类型，首次版本')
     set((state) => ({
       joints: [...state.joints, joint].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN')),
       selectedJointId: joint.id,
@@ -80,7 +85,10 @@ export const useJointStore = create<JointState>((set, get) => ({
 
   addFurniture: async (draft) => {
     const furniture: Furniture = { ...draft, id: createId('furniture'), schemaRev: 2 }
-    await db.furniture.add(furniture)
+    // 家具关系属于类型资料，保存时整体记入版本，旧版本不变
+    await saveWithVersion(furniture.jointTypeId, async () => {
+      await db.furniture.add(furniture)
+    }, '登记家具关联')
     set((state) => ({ furniture: [...state.furniture, furniture] }))
     return furniture
   },
@@ -88,21 +96,26 @@ export const useJointStore = create<JointState>((set, get) => ({
   setSelectedJoint: (id) => set({ selectedJointId: id }),
 
   updateMemberDimensions: async (memberId, dimensions) => {
+    const previous = await db.members.get(memberId)
     await db.members.update(memberId, dimensions)
     set((state) => ({
       members: state.members.map((member) => (
         member.id === memberId ? { ...member, ...dimensions } : member
       )),
     }))
+    // 尺寸常被连续微调，停顿后合并落一条版本，避免每次按键都建档
+    if (previous) scheduleJointVersion(previous.jointTypeId, '修改构件尺寸')
   },
 
   renameMember: async (memberId, name) => {
+    const previous = await db.members.get(memberId)
     await db.members.update(memberId, { name })
     set((state) => ({
       members: state.members.map((member) => (
         member.id === memberId ? { ...member, name } : member
       )),
     }))
+    if (previous) scheduleJointVersion(previous.jointTypeId, '修改构件名称')
   },
 }))
 

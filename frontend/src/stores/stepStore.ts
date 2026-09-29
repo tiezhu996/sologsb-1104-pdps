@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { DisassemblyStep } from '../types/step'
 import { db } from '../utils/db'
+import { saveWithVersion } from '../utils/versions'
 
 interface StepState {
   steps: DisassemblyStep[]
@@ -36,8 +37,12 @@ export const useStepStore = create<StepState>((set, get) => ({
     if (!moved) return
     ordered.splice(to, 0, moved)
     const resequenced = ordered.map((step, index) => ({ ...step, seq: index + 1 }))
+    const jointTypeId = moved.jointTypeId
+    // 调序与版本快照同事务：落库失败则整体回滚，前端状态也不改动
+    await saveWithVersion(jointTypeId, async () => {
+      await db.steps.bulkPut(resequenced)
+    }, '调整拆装步序')
     set({ steps: resequenced, currentStepIndex: to })
-    await db.steps.bulkPut(resequenced)
   },
 
   setCurrentStep: (index) => set({

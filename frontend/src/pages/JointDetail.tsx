@@ -4,8 +4,10 @@ import { BlankPanel } from '../components/common/BlankPanel'
 import { DifficultyTag } from '../components/common/DifficultyTag'
 import { SizeField } from '../components/common/SizeField'
 import { StepRail } from '../components/common/StepRail'
+import { VersionArchive } from '../components/common/VersionArchive'
 import { useStepOrder } from '../hooks/useStepOrder'
 import { useJointStore } from '../stores/jointStore'
+import { useStepStore } from '../stores/stepStore'
 import { checkTolerance, formatDimension } from '../utils/measure'
 import { exportJointData } from '../utils/export'
 
@@ -18,11 +20,18 @@ export default function JointDetail() {
   const loading = useJointStore((state) => state.loading)
   const loadAll = useJointStore((state) => state.loadAll)
   const updateMemberDimensions = useJointStore((state) => state.updateMemberDimensions)
+  const loadSteps = useStepStore((state) => state.loadSteps)
   const { steps, totalDurationSec, currentStepIndex, move, setCurrentStep } = useStepOrder(id)
 
   useEffect(() => {
     void loadAll()
   }, [loadAll])
+
+  // 恢复版本后重新拉取活表：构件、家具来自 jointStore，步序来自 stepStore
+  const handleVersionRestored = () => {
+    void loadAll()
+    if (id) void loadSteps(id)
+  }
 
   const joint = joints.find((item) => item.id === id)
   const currentMembers = members
@@ -208,6 +217,8 @@ export default function JointDetail() {
           )}
         </div>
       </section>
+
+      <VersionArchive jointId={joint.id} onRestored={handleVersionRestored} />
     </div>
   )
 }
