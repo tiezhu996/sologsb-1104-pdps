@@ -1,13 +1,18 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { BlankPanel } from '../components/common/BlankPanel'
 import { DifficultyTag } from '../components/common/DifficultyTag'
 import { SizeField } from '../components/common/SizeField'
 import { StepRail } from '../components/common/StepRail'
 import { useStepOrder } from '../hooks/useStepOrder'
+import { useDiagramStore } from '../stores/diagramStore'
 import { useJointStore } from '../stores/jointStore'
+import { useStepStore } from '../stores/stepStore'
+import { useVersionStore } from '../stores/versionStore'
+import type { JointVersion } from '../types/version'
 import { checkTolerance, formatDimension } from '../utils/measure'
-import { exportJointData } from '../utils/export'
+import { exportJointData, exportVersionData } from '../utils/export'
+import { validateSnapshot, VersionIntegrityError } from '../utils/versionArchive'
 
 export default function JointDetail() {
   const { id: idParam } = useParams()
@@ -19,10 +24,88 @@ export default function JointDetail() {
   const loadAll = useJointStore((state) => state.loadAll)
   const updateMemberDimensions = useJointStore((state) => state.updateMemberDimensions)
   const { steps, totalDurationSec, currentStepIndex, move, setCurrentStep } = useStepOrder(id)
+  const versions = useVersionStore((state) => state.versions)
+  const versionsLoading = useVersionStore((state) => state.loading)
+  const loadVersions = useVersionStore((state) => state.loadVersions)
+  const saveVersion = useVersionStore((state) => state.saveVersion)
+  const restoreVersion = useVersionStore((state) => state.restoreVersion)
+
+  const [versionNotice, setVersionNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const [savingVersion, setSavingVersion] = useState(false)
+  const [restoreCandidate, setRestoreCandidate] = useState<JointVersion | null>(null)
+  const [restoreErrors, setRestoreErrors] = useState<string[]>([])
+  const [restoreConfirmOpen, setRestoreConfirmOpen] = useState(false)
+  const [restoring, setRestoring] = useState(false)
 
   useEffect(() => {
     void loadAll()
   }, [loadAll])
+
+  useEffect(() => {
+    if (id) void loadVersions(id)
+  }, [id, loadVersions])
+
+  const handleSaveVersion = async () => {
+    setSavingVersion(true)
+    setVersionNotice(null)
+    try {
+      await saveVersion(id)
+      setVersionNotice({
+        kind: 'success',
+        text: '已保存当前版本：文字、构件、步序、示意图与家具关系已整体封存，后续编辑不会改动旧记录。',
+      })
+    } catch {
+      setVersionNotice({ kind: 'error', text: '版本保存失败，请重试；当前资料未受影响。' })
+    } finally {
+      setSavingVersion(false)
+    }
+  }
+
+  const requestRestore = (version: JointVersion) => {
+    const check = validateSnapshot(version.snapshot)
+    setRestoreCandidate(version)
+    setVersionNotice(null)
+    if (check.ok) {
+      setRestoreErrors([])
+      setRestoreConfirmOpen(true)
+    } else {
+      setRestoreErrors(check.errors)
+      setRestoreConfirmOpen(false)
+    }
+  }
+
+  const cancelRestore = () => {
+    setRestoreCandidate(null)
+    setRestoreErrors([])
+    setRestoreConfirmOpen(false)
+  }
+
+  const confirmRestore = async () => {
+    if (!restoreCandidate) return
+    setRestoring(true)
+    setVersionNotice(null)
+    try {
+      await restoreVersion(restoreCandidate)
+      await Promise.all([
+        useJointStore.getState().loadAll(),
+        useStepStore.getState().loadSteps(id),
+        useDiagramStore.getState().loadDiagrams(id),
+        loadVersions(id),
+      ])
+      setVersionNotice({ kind: 'success', text: `已整体替换为 v${restoreCandidate.versionNo} 的档案内容。` })
+      cancelRestore()
+    } catch (error) {
+      if (error instanceof VersionIntegrityError) {
+        setRestoreErrors(error.reasons)
+        setRestoreConfirmOpen(false)
+        setVersionNotice({ kind: 'error', text: '引用完整性校验未通过，已拒绝恢复并保持现状。' })
+      } else {
+        setVersionNotice({ kind: 'error', text: '写入失败，已保持现状，未改动任何记录。' })
+      }
+    } finally {
+      setRestoring(false)
+    }
+  }
 
   const joint = joints.find((item) => item.id === id)
   const currentMembers = members
@@ -166,6 +249,109 @@ export default function JointDetail() {
               </tbody>
             </table>
           </div>
+        )}
+      </section>
+
+      <section className="panel p-5 sm:p-6" data-testid="version-archive">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-semibold text-wood-900">版本档案</h2>
+            <p className="mt-1 max-w-2xl text-sm leading-6 text-stone-500">
+              保存时把当前文字、构件、步序、示意图与家具关系整体封存；恢复前先校验引用完整性，缺构件、缺步骤图或步序重复都会说明原因并拒绝，检查通过才整体替换，写入失败保持现状。
+            </p>
+          </div>
+          <button type="button" className="primary-button" disabled={savingVersion} onClick={() => void handleSaveVersion()}>
+            {savingVersion ? '保存中…' : '保存当前版本'}
+          </button>
+        </div>
+
+        {versionNotice ? (
+          <div
+            className={`mt-4 rounded-xl border px-4 py-3 text-sm ${
+              versionNotice.kind === 'success'
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                : 'border-rose-200 bg-rose-50 text-rose-800'
+            }`}
+            role="status"
+          >
+            {versionNotice.text}
+          </div>
+        ) : null}
+
+        {versionsLoading && versions.length === 0 ? (
+          <p className="mt-5 text-sm text-stone-500">正在读取版本档案…</p>
+        ) : versions.length === 0 ? (
+          <div className="mt-5">
+            <BlankPanel title="暂无版本档案" description="点击「保存当前版本」封存第一版资料；升级前的旧记录会在打开时自动补建首次版本。" />
+          </div>
+        ) : (
+          <ul className="mt-5 space-y-3">
+            {versions.map((version) => {
+              const snapshot = version.snapshot
+              const counts = [
+                `构件 ${snapshot.members.length}`,
+                `步序 ${snapshot.steps.length}`,
+                `示意图 ${snapshot.diagrams.length}`,
+                `家具 ${snapshot.furniture.length}`,
+              ]
+              const isCandidate = restoreCandidate?.id === version.id
+              return (
+                <li key={version.id} className="rounded-xl border border-wood-100 bg-white px-4 py-4" data-testid="version-row">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-wood-700 text-sm font-bold text-white">
+                      v{version.versionNo}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-wood-900">{version.label}</p>
+                      <p className="text-xs text-stone-500">{new Date(version.createdAt).toLocaleString('zh-CN')} 封存</p>
+                    </div>
+                    <div className="ml-auto flex flex-wrap items-center gap-2">
+                      <button type="button" className="secondary-button" onClick={() => void exportVersionData(version)}>
+                        导出此版本
+                      </button>
+                      <button type="button" className="primary-button" onClick={() => requestRestore(version)}>
+                        恢复此版本
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs text-stone-600">
+                    {counts.map((count) => (
+                      <span key={count} className="rounded-full bg-wood-50 px-2.5 py-1 text-wood-700">{count}</span>
+                    ))}
+                  </div>
+
+                  {isCandidate && restoreErrors.length > 0 ? (
+                    <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3" data-testid="version-restore-errors">
+                      <p className="text-sm font-semibold text-rose-800">引用完整性校验未通过，已拒绝恢复并保持现状：</p>
+                      <ul className="mt-2 list-disc space-y-1 pl-5 text-xs leading-5 text-rose-700">
+                        {restoreErrors.map((reason) => (
+                          <li key={reason}>{reason}</li>
+                        ))}
+                      </ul>
+                      <div className="mt-3 flex justify-end">
+                        <button type="button" className="secondary-button" onClick={cancelRestore}>知道了</button>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {isCandidate && restoreConfirmOpen ? (
+                    <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3" data-testid="version-restore-confirm">
+                      <p className="text-sm font-semibold text-amber-900">确认恢复到 v{version.versionNo}？</p>
+                      <p className="mt-1 text-xs leading-5 text-amber-800">
+                        将用该版本封存的内容整体替换当前类型的文字、构件、步序、示意图与家具关系；当前未封存的改动会被覆盖。写入失败将保持现状，不会改动任何记录。
+                      </p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button type="button" className="primary-button" disabled={restoring} onClick={() => void confirmRestore()}>
+                          {restoring ? '恢复中…' : '确认整体替换'}
+                        </button>
+                        <button type="button" className="secondary-button" disabled={restoring} onClick={cancelRestore}>取消</button>
+                      </div>
+                    </div>
+                  ) : null}
+                </li>
+              )
+            })}
+          </ul>
         )}
       </section>
 

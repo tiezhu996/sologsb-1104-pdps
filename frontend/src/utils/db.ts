@@ -1,9 +1,11 @@
 import Dexie, { type Table } from 'dexie'
-import type { Diagram, HitArea } from '../types/diagram'
+import type { Diagram, DiagramView, HitArea } from '../types/diagram'
 import type { Furniture } from '../types/furniture'
 import type { JointType } from '../types/jointType'
 import type { Member } from '../types/member'
 import type { DisassemblyStep } from '../types/step'
+import type { JointVersion } from '../types/version'
+import { buildSnapshot, createVersionRecord } from './versionArchive'
 
 export class MortiseDatabase extends Dexie {
   joints!: Table<JointType, string>
@@ -11,6 +13,7 @@ export class MortiseDatabase extends Dexie {
   steps!: Table<DisassemblyStep, string>
   diagrams!: Table<Diagram, string>
   furniture!: Table<Furniture, string>
+  versions!: Table<JointVersion, string>
 
   constructor() {
     super('gbmortise-db')
@@ -39,6 +42,31 @@ export class MortiseDatabase extends Dexie {
       await transaction.table<Furniture, string>('furniture').toCollection().modify((furniture) => {
         furniture.schemaRev = 2
       })
+    })
+    this.version(3).stores({
+      ...schema,
+      versions: 'id, jointTypeId, versionNo, createdAt',
+    }).upgrade(async (transaction) => {
+      // 旧记录升级后仍可打开：为每个已有榫卯类型自动补建首次版本 v1。
+      // 升级事务与数据迁移同生共死，任何一步失败都会整体回滚。
+      const upgradedAt = new Date()
+      const joints = await transaction.table<JointType, string>('joints').toArray()
+      for (const joint of joints) {
+        const [members, steps, diagrams, furniture] = await Promise.all([
+          transaction.table<Member, string>('members').where('jointTypeId').equals(joint.id).toArray(),
+          transaction.table<DisassemblyStep, string>('steps').where('jointTypeId').equals(joint.id).toArray(),
+          transaction.table<Diagram, string>('diagrams').where('jointTypeId').equals(joint.id).toArray(),
+          transaction.table<Furniture, string>('furniture').where('jointTypeId').equals(joint.id).toArray(),
+        ])
+        const snapshot = buildSnapshot(joint, members, steps, diagrams, furniture)
+        await transaction.table<JointVersion, string>('versions').add(
+          createVersionRecord(joint.id, 1, snapshot, {
+            id: `version-${joint.id}-v1`,
+            label: 'v1 · 初始版本',
+            createdAt: upgradedAt,
+          }),
+        )
+      }
     })
   }
 }
@@ -101,60 +129,75 @@ const stepSeeds: DisassemblyStep[] = [
   { id: 'step-bs-3', jointTypeId: 'joint-shoulder', seq: 3, action: '装配', direction: '斜向', tool: '木槌', riskNote: '抱肩弧面完全贴服后再压实定位。', holdSec: 10 },
 ]
 
-const diagramSeeds: Diagram[] = [
+const seedPolygonPoints = [
+  '40,188 190,188 214,252 18,252',
+  '196,50 324,50 324,148 196,148',
+  '336,116 498,116 498,254 352,254',
+]
+
+const diagramSeedSpecs: Array<{
+  jointId: string
+  stepPrefix: string
+  memberIds: [string, string, string]
+  labels: [string, string, string]
+  titles: [string, string, string]
+  views: [DiagramView, DiagramView, DiagramView]
+}> = [
   {
-    id: 'diagram-dovetail',
-    jointTypeId: 'joint-dovetail',
-    stepId: 'step-dt-1',
-    title: '燕尾榫轴向拆解',
-    view: '轴测',
-    svgMarkup: makeSeedSvg('燕尾榫 · 轴测拆解', ['member-dt-tenon', 'member-dt-frame', 'member-dt-socket'], ['榫头', '大边', '榫眼']),
-    hitAreas: [
-      { id: 'hit-dt-tenon', memberId: 'member-dt-tenon', label: '榫头', points: '40,188 190,188 214,252 18,252' },
-      { id: 'hit-dt-frame', memberId: 'member-dt-frame', label: '大边', points: '196,50 324,50 324,148 196,148' },
-      { id: 'hit-dt-socket', memberId: 'member-dt-socket', label: '榫眼', points: '336,116 498,116 498,254 352,254' },
-    ],
+    jointId: 'joint-dovetail',
+    stepPrefix: 'step-dt',
+    memberIds: ['member-dt-tenon', 'member-dt-frame', 'member-dt-socket'],
+    labels: ['榫头', '大边', '榫眼'],
+    titles: ['燕尾榫 · 轴向拆解', '燕尾榫 · 侧向带出', '燕尾榫 · 斜向装配'],
+    views: ['轴测', '正视', '俯视'],
   },
   {
-    id: 'diagram-mitre',
-    jointTypeId: 'joint-mitre',
-    stepId: 'step-mt-1',
-    title: '格肩榫斜肩检查',
-    view: '正视',
-    svgMarkup: makeSeedSvg('格肩榫 · 正面试合', ['member-mt-tenon', 'member-mt-socket', 'member-mt-rail'], ['榫头', '榫眼', '抹头']),
-    hitAreas: [
-      { id: 'hit-mt-tenon', memberId: 'member-mt-tenon', label: '榫头', points: '40,188 190,188 214,252 18,252' },
-      { id: 'hit-mt-socket', memberId: 'member-mt-socket', label: '榫眼', points: '196,50 324,50 324,148 196,148' },
-      { id: 'hit-mt-rail', memberId: 'member-mt-rail', label: '抹头', points: '336,116 498,116 498,254 352,254' },
-    ],
+    jointId: 'joint-mitre',
+    stepPrefix: 'step-mt',
+    memberIds: ['member-mt-tenon', 'member-mt-socket', 'member-mt-rail'],
+    labels: ['榫头', '榫眼', '抹头'],
+    titles: ['格肩榫 · 轴向拆解', '格肩榫 · 侧向退出', '格肩榫 · 斜向装配'],
+    views: ['轴测', '正视', '俯视'],
   },
   {
-    id: 'diagram-corner',
-    jointTypeId: 'joint-corner',
-    stepId: 'step-zj-1',
-    title: '粽角榫三向咬合',
-    view: '俯视',
-    svgMarkup: makeSeedSvg('粽角榫 · 三向咬合', ['member-zj-frame', 'member-zj-socket', 'member-zj-rail'], ['大边', '榫眼', '抹头']),
-    hitAreas: [
-      { id: 'hit-zj-frame', memberId: 'member-zj-frame', label: '大边', points: '40,188 190,188 214,252 18,252' },
-      { id: 'hit-zj-socket', memberId: 'member-zj-socket', label: '榫眼', points: '196,50 324,50 324,148 196,148' },
-      { id: 'hit-zj-rail', memberId: 'member-zj-rail', label: '抹头', points: '336,116 498,116 498,254 352,254' },
-    ],
+    jointId: 'joint-corner',
+    stepPrefix: 'step-zj',
+    memberIds: ['member-zj-frame', 'member-zj-socket', 'member-zj-rail'],
+    labels: ['大边', '榫眼', '抹头'],
+    titles: ['粽角榫 · 轴向拆解', '粽角榫 · 斜向松脱', '粽角榫 · 三向装配'],
+    views: ['俯视', '正视', '轴测'],
   },
   {
-    id: 'diagram-shoulder',
-    jointTypeId: 'joint-shoulder',
-    stepId: 'step-bs-1',
-    title: '抱肩榫圆弧贴合',
-    view: '轴测',
-    svgMarkup: makeSeedSvg('抱肩榫 · 圆弧贴合', ['member-bs-tenon', 'member-bs-socket', 'member-bs-rail'], ['榫头', '榫眼', '抹头']),
-    hitAreas: [
-      { id: 'hit-bs-tenon', memberId: 'member-bs-tenon', label: '榫头', points: '40,188 190,188 214,252 18,252' },
-      { id: 'hit-bs-socket', memberId: 'member-bs-socket', label: '榫眼', points: '196,50 324,50 324,148 196,148' },
-      { id: 'hit-bs-rail', memberId: 'member-bs-rail', label: '抹头', points: '336,116 498,116 498,254 352,254' },
-    ],
+    jointId: 'joint-shoulder',
+    stepPrefix: 'step-bs',
+    memberIds: ['member-bs-tenon', 'member-bs-socket', 'member-bs-rail'],
+    labels: ['榫头', '榫眼', '抹头'],
+    titles: ['抱肩榫 · 侧向松胶', '抱肩榫 · 轴向退出', '抱肩榫 · 圆弧装配'],
+    views: ['轴测', '正视', '俯视'],
   },
 ]
+
+// 每个步序都绑定一张示意图，避免出现「缺步骤图」的不完整档案。
+const diagramSeeds: Diagram[] = diagramSeedSpecs.flatMap((spec) =>
+  spec.titles.map((title, index) => {
+    const stepNo = index + 1
+    const id = `diagram-${spec.jointId}-${stepNo}`
+    return {
+      id,
+      jointTypeId: spec.jointId,
+      stepId: `${spec.stepPrefix}-${stepNo}`,
+      title,
+      view: spec.views[index],
+      svgMarkup: makeSeedSvg(title, spec.memberIds, spec.labels),
+      hitAreas: spec.memberIds.map((memberId, areaIndex) => ({
+        id: `hit-${spec.jointId}-${stepNo}-${areaIndex + 1}`,
+        memberId,
+        label: spec.labels[areaIndex],
+        points: seedPolygonPoints[areaIndex],
+      })),
+    }
+  }),
+)
 
 const jointSeeds: JointType[] = [
   { id: 'joint-dovetail', name: '燕尾榫', family: '出头', difficulty: '入门', strengthNote: '齿肩互锁，抵抗水平拉脱，同时允许木材轻微呼吸。', glueNeeded: false },
@@ -175,12 +218,29 @@ const furnitureSeeds: Furniture[] = [
 export const db = new MortiseDatabase()
 
 async function writeSeedData(): Promise<void> {
-  await db.transaction('rw', [db.joints, db.members, db.steps, db.diagrams, db.furniture], async () => {
+  const seededAt = new Date()
+  await db.transaction('rw', [db.joints, db.members, db.steps, db.diagrams, db.furniture, db.versions], async () => {
     await db.joints.bulkAdd(jointSeeds.map((item) => ({ ...item, schemaRev: 2 })))
     await db.members.bulkAdd(memberSeeds.map((item) => ({ ...item, schemaRev: 2 })))
     await db.steps.bulkAdd(stepSeeds.map((item) => ({ ...item, schemaRev: 2 })))
     await db.diagrams.bulkAdd(diagramSeeds.map((item) => ({ ...item, schemaRev: 2 })))
     await db.furniture.bulkAdd(furnitureSeeds.map((item) => ({ ...item, schemaRev: 2 })))
+    // 全新安装时也为每个种子类型补建首次版本，保证版本档案始终可读。
+    const seedVersions = jointSeeds.map((joint) => {
+      const snapshot = buildSnapshot(
+        joint,
+        memberSeeds.filter((member) => member.jointTypeId === joint.id),
+        stepSeeds.filter((step) => step.jointTypeId === joint.id),
+        diagramSeeds.filter((diagram) => diagram.jointTypeId === joint.id),
+        furnitureSeeds.filter((item) => item.jointTypeId === joint.id),
+      )
+      return createVersionRecord(joint.id, 1, snapshot, {
+        id: `version-${joint.id}-v1`,
+        label: 'v1 · 初始版本',
+        createdAt: seededAt,
+      })
+    })
+    await db.versions.bulkAdd(seedVersions)
   })
 }
 
